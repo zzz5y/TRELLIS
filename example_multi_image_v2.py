@@ -85,15 +85,15 @@ def main():
         outputs['gaussian'][0],
         outputs['mesh'][0],
         # Optional parameters
-        simplify=0.95,          # Ratio of triangles to remove in the simplification process
-        texture_size=1024,      # Size of the texture used for the GLB
+        simplify=0,          # Ratio of triangles to remove in the simplification process
+        texture_size=4096,      # Size of the texture used for the GLB
     )
     glb.export(os.path.join(final_output_path, "sample.glb"))
 
     # Save Gaussians as PLY files
     outputs['gaussian'][0].save_ply(os.path.join(final_output_path, "sample.ply"))
     print(type(outputs['mesh'][0]))
-    print(f"file save at")
+    print(f"file save at:{final_output_path}")
     #o3d.io.write_triangle_mesh(os.path.join(args.output, "sample.obj"), outputs['mesh'][0])
     
 if __name__ == "__main__":
