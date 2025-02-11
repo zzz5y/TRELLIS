@@ -13,7 +13,7 @@ from .base import Pipeline
 from . import samplers
 from ..modules import sparse as sp
 from ..representations import Gaussian, Strivec, MeshExtractResult
-
+from transformers import AutoModelForImageSegmentation
 
 class TrellisImageTo3DPipeline(Pipeline):
     """
@@ -340,6 +340,72 @@ class TrellisImageTo3DPipeline(Pipeline):
         sampler._inference_model = sampler._old_inference_model
         delattr(sampler, f'_old_inference_model')
 
+    def preprocess_image_RMBG(self, input: Image.Image) -> Image.Image:
+        """
+        Preprocess the input image.
+        """
+        # Check if the image has an alpha channel and whether to use it directly
+        has_alpha = False
+        if input.mode == 'RGBA':
+            alpha = np.array(input)[:, :, 3]
+            if not np.all(alpha == 255):
+                has_alpha = True
+
+        #print(f"has_alpha:{has_alpha}")
+        
+        #if not has_alpha:
+        if True:
+            model = AutoModelForImageSegmentation.from_pretrained('briaai/RMBG-2.0', trust_remote_code=True)
+            torch.set_float32_matmul_precision(['high', 'highest'][0])
+            model.to('cuda')
+            model.eval()
+
+            # Data settings
+            image_size = (1024, 1024)
+            # Convert to RGB before applying transforms
+            transform_image = transforms.Compose([
+                transforms.Lambda(lambda img: img.convert('RGB')),
+                transforms.Resize(image_size),
+                transforms.ToTensor(),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+            ])
+
+            # Ensure image is in RGB mode for prediction
+            input_rgb = input.convert('RGB')
+            input_images = transform_image(input_rgb).unsqueeze(0).to('cuda')
+
+            # Prediction
+            with torch.no_grad():
+                preds = model(input_images)[-1].sigmoid().cpu()
+            pred = preds[0].squeeze()
+            pred_pil = transforms.ToPILImage()(pred)
+            mask = pred_pil.resize(input.size)
+            input.putalpha(mask)
+
+            torch.cuda.empty_cache()
+            del model
+
+        output = input
+
+        # Crop and resize based on alpha channel after background removal
+        output_np = np.array(output)
+        alpha = output_np[:, :, 3]
+        bbox = np.argwhere(alpha > 0.8 * 255)
+        bbox = np.min(bbox[:, 1]), np.min(bbox[:, 0]), np.max(bbox[:, 1]), np.max(bbox[:, 0])
+        center = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+        size = max(bbox[2] - bbox[0], bbox[3] - bbox[1])
+        size = int(size * 1.2)
+        bbox = center[0] - size // 2, center[1] - size // 2, center[0] + size // 2, center[1] + size // 2
+        output = output.crop(bbox)  # type: ignore
+        output = output.resize((518, 518), Image.Resampling.LANCZOS)
+
+        # Blend RGB and alpha channels and normalize the result
+        output = np.array(output).astype(np.float32) / 255
+        output = output[:, :, :3] * output[:, :, 3:4]
+        output = Image.fromarray((output * 255).astype(np.uint8))
+
+        return output
+    
     @torch.no_grad()
     def run_multi_image(
         self,
@@ -363,6 +429,7 @@ class TrellisImageTo3DPipeline(Pipeline):
             preprocess_image (bool): Whether to preprocess the image.
         """
         if preprocess_image:
+            #images = [self.preprocess_image(image) for image in images]
             images = [self.preprocess_image(image) for image in images]
         cond = self.get_cond(images)
         cond['neg_cond'] = cond['neg_cond'][:1]
@@ -374,3 +441,39 @@ class TrellisImageTo3DPipeline(Pipeline):
         with self.inject_sampler_multi_image('slat_sampler', len(images), slat_steps, mode=mode):
             slat = self.sample_slat(cond, coords, slat_sampler_params)
         return self.decode_slat(slat, formats)
+    
+    @torch.no_grad()
+    def run_multi_image_v2(
+        self,
+        images: List[Image.Image],
+        num_samples: int = 1,
+        seed: int = 42,
+        sparse_structure_sampler_params: dict = {},
+        slat_sampler_params: dict = {},
+        formats: List[str] = ['mesh', 'gaussian', 'radiance_field'],
+        preprocess_image: bool = True,
+        mode: Literal['stochastic', 'multidiffusion'] = 'stochastic',
+    ) -> dict:
+        """
+        Run the pipeline with multiple images as condition
+
+        Args:
+            images (List[Image.Image]): The multi-view images of the assets
+            num_samples (int): The number of samples to generate.
+            sparse_structure_sampler_params (dict): Additional parameters for the sparse structure sampler.
+            slat_sampler_params (dict): Additional parameters for the structured latent sampler.
+            preprocess_image (bool): Whether to preprocess the image.
+        """
+        if preprocess_image:
+            #images = [self.preprocess_image(image) for image in images]
+            images = [self.preprocess_image_RMBG(image) for image in images]
+        cond = self.get_cond(images)
+        cond['neg_cond'] = cond['neg_cond'][:1]
+        torch.manual_seed(seed)
+        ss_steps = {**self.sparse_structure_sampler_params, **sparse_structure_sampler_params}.get('steps')
+        with self.inject_sampler_multi_image('sparse_structure_sampler', len(images), ss_steps, mode=mode):
+            coords = self.sample_sparse_structure(cond, num_samples, sparse_structure_sampler_params)
+        slat_steps = {**self.slat_sampler_params, **slat_sampler_params}.get('steps')
+        with self.inject_sampler_multi_image('slat_sampler', len(images), slat_steps, mode=mode):
+            slat = self.sample_slat(cond, coords, slat_sampler_params)
+        return self.decode_slat(slat, formats),images

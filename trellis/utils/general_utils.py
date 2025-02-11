@@ -1,7 +1,7 @@
 import numpy as np
 import cv2
 import torch
-
+import os
 
 # Dictionary utils
 def _dict_merge(dicta, dictb, prefix=''):
@@ -185,3 +185,11 @@ def indent(s, n=4):
         lines[i] = ' ' * n + lines[i]
     return '\n'.join(lines)
 
+
+def save_imgs(images,path):
+    for idx, img in enumerate(images):
+        # Generate a filename (e.g., image_0.png, image_1.png, etc.)
+        image_filename = os.path.join(path, f"image_{idx}.png")
+        
+        # Save the image (if it's a PIL image, you can use .save())
+        img.save(image_filename)
