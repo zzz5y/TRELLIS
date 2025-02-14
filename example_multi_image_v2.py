@@ -21,7 +21,8 @@ import traceback
 import pymeshlab
 import pymeshlab.pmeshlab
 
-
+import trimesh
+import pyfbx
 
 # Set up logging
 logging.basicConfig(
@@ -52,6 +53,8 @@ def main():
 
     # 确保输出目录存在
     os.makedirs(final_output_path, exist_ok=True)
+    os.makedirs(os.path.join(final_output_path,"obj"), exist_ok=True)
+    #os.makedirs(os.path.join(final_output_path,"fbx"), exist_ok=True)
     images_output_path = os.path.join(final_output_path, "images_RMBG")
     if not os.path.exists(images_output_path):
         os.makedirs(images_output_path)
@@ -116,16 +119,34 @@ def main():
     
     simplify=0#0.95
     texture_size=2048#1024
+    get_srgb_texture=True
+    
     glb = postprocessing_utils.to_glb(
         outputs['gaussian'][0],
         outputs['mesh'][0],
         # Optional parameters
         simplify=simplify,          # Ratio of triangles to remove in the simplification process
         texture_size=texture_size,      # Size of the texture used for the GLB
+        get_srgb_texture=get_srgb_texture
     )
     glb.export(os.path.join(final_output_path, "sample.glb"))
-
+    glb.export(os.path.join(final_output_path,"obj", "sample.obj"), file_type='obj')
+    
+    # fbx_scene=postprocessing_utils.to_fbx(
+    #     outputs['gaussian'][0],
+    #     outputs['mesh'][0],
+    #     # Optional parameters
+    #     simplify=simplify,          # Ratio of triangles to remove in the simplification process
+    #     texture_size=texture_size,      # Size of the texture used for the GLB
+    # )
+    
+    # fbx_scene.export(os.path.join(final_output_path,"fbx", "sample.fbx"))
+    # 创建一个可写的 Resolver 实例
+    #resolver = trimesh.visual.resolvers.FilePathResolver('path_to_save_directory')
+    # 导出 OBJ 文件，并同时生成 MTL 文件
+    #outputs['mesh'][0].export(os.path.join(final_output_path, "sample.obj"), file_type='obj', write_texture=True, resolver=resolver)
     # Save Gaussians as PLY files
+    
     outputs['gaussian'][0].save_ply(os.path.join(final_output_path, "sample.ply"))
     
     logger.info(f"Process completed. Files saved at {final_output_path}")

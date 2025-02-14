@@ -12,6 +12,7 @@ from pymeshfix import _meshfix
 import igraph
 import cv2
 from PIL import Image
+import pyfbx
 from .random_utils import sphere_hammersley_sequence
 from .render_utils import render_multiview
 from ..renderers import GaussianRenderer
@@ -307,6 +308,7 @@ def bake_texture(
     far: float = 10.0,
     mode: Literal['fast', 'opt'] = 'opt',
     lambda_tv: float = 1e-2,
+    srgb_space: bool = False,
     verbose: bool = False,
 ):
     """
@@ -359,6 +361,10 @@ def bake_texture(
         texture[mask] /= texture_weights[mask][:, None]
         texture = np.clip(texture.reshape(texture_size, texture_size, 3).cpu().numpy() * 255, 0, 255).astype(np.uint8)
 
+        if srgb_space:
+            # convert the texture from rgb space to srgb
+            texture = rgb_to_srgb_image(texture)
+        
         # inpaint
         mask = (texture_weights == 0).cpu().numpy().astype(np.uint8).reshape(texture_size, texture_size)
         texture = cv2.inpaint(texture, mask, 3, cv2.INPAINT_TELEA)
@@ -406,6 +412,11 @@ def bake_texture(
                 optimizer.param_groups[0]['lr'] = cosine_anealing(optimizer, step, total_steps, 1e-2, 1e-5)
                 pbar.set_postfix({'loss': loss.item()})
                 pbar.update()
+        
+        if srgb_space:
+            # convert the texture from rgb space to srgb
+            texture = rgb_to_srgb_image(texture)
+        
         texture = np.clip(texture[0].flip(0).detach().cpu().numpy() * 255, 0, 255).astype(np.uint8)
         mask = 1 - utils3d.torch.rasterize_triangle_faces(
             rastctx, (uvs * 2 - 1)[None], faces, texture_size, texture_size
@@ -417,6 +428,8 @@ def bake_texture(
     return texture
 
 
+
+
 def to_glb(
     app_rep: Union[Strivec, Gaussian],
     mesh: MeshExtractResult,
@@ -425,6 +438,8 @@ def to_glb(
     fill_holes_max_size: float = 0.04,
     texture_size: int = 1024,
     debug: bool = False,
+    get_srgb_texture: bool = False,
+    render_resolution:int = 1024,
     verbose: bool = True,
 ) -> trimesh.Trimesh:
     """
@@ -461,7 +476,7 @@ def to_glb(
     vertices, faces, uvs = parametrize_mesh(vertices, faces)
 
     # bake texture
-    observations, extrinsics, intrinsics = render_multiview(app_rep, resolution=1024, nviews=100)
+    observations, extrinsics, intrinsics = render_multiview(app_rep, resolution=render_resolution, nviews=100)
     masks = [np.any(observation > 0, axis=-1) for observation in observations]
     extrinsics = [extrinsics[i].cpu().numpy() for i in range(len(extrinsics))]
     intrinsics = [intrinsics[i].cpu().numpy() for i in range(len(intrinsics))]
@@ -470,6 +485,7 @@ def to_glb(
         observations, masks, extrinsics, intrinsics,
         texture_size=texture_size, mode='opt',
         lambda_tv=0.01,
+        srgb_space=get_srgb_texture,
         verbose=verbose
     )
     texture = Image.fromarray(texture)
@@ -484,6 +500,98 @@ def to_glb(
     mesh = trimesh.Trimesh(vertices, faces, visual=trimesh.visual.TextureVisuals(uv=uvs, material=material))
     return mesh
 
+def to_fbx(
+    app_rep: Union[Strivec, Gaussian],
+    mesh: MeshExtractResult,
+    simplify: float = 0.95,
+    fill_holes: bool = True,
+    fill_holes_max_size: float = 0.04,
+    texture_size: int = 1024,
+    debug: bool = False,
+    verbose: bool = True,
+) -> None:
+    """
+    Convert a generated asset to an FBX file.
+
+    Args:
+        app_rep (Union[Strivec, Gaussian]): Appearance representation.
+        mesh (MeshExtractResult): Extracted mesh.
+        simplify (float): Ratio of faces to remove in simplification.
+        fill_holes (bool): Whether to fill holes in the mesh.
+        fill_holes_max_size (float): Maximum area of a hole to fill.
+        texture_size (int): Size of the texture.
+        debug (bool): Whether to print debug information.
+        verbose (bool): Whether to print progress.
+    """
+    vertices = mesh.vertices.cpu().numpy()
+    faces = mesh.faces.cpu().numpy()
+    
+    # Mesh postprocessing
+    vertices, faces = postprocess_mesh(
+        vertices, faces,
+        simplify=simplify > 0,
+        simplify_ratio=simplify,
+        fill_holes=fill_holes,
+        fill_holes_max_hole_size=fill_holes_max_size,
+        fill_holes_max_hole_nbe=int(250 * np.sqrt(1-simplify)),
+        fill_holes_resolution=1024,
+        fill_holes_num_views=1000,
+        debug=debug,
+        verbose=verbose,
+    )
+
+    # Parametrize mesh
+    vertices, faces, uvs = parametrize_mesh(vertices, faces)
+
+    # Bake texture
+    observations, extrinsics, intrinsics = render_multiview(app_rep, resolution=1024, nviews=100)
+    masks = [np.any(observation > 0, axis=-1) for observation in observations]
+    extrinsics = [extrinsics[i].cpu().numpy() for i in range(len(extrinsics))]
+    intrinsics = [intrinsics[i].cpu().numpy() for i in range(len(intrinsics))]
+    texture = bake_texture(
+        vertices, faces, uvs,
+        observations, masks, extrinsics, intrinsics,
+        texture_size=texture_size, mode='opt',
+        lambda_tv=0.01,
+        verbose=verbose
+    )
+    texture = Image.fromarray(texture)
+
+    # Rotate mesh (from z-up to y-up)
+    vertices = vertices @ np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]])
+
+    # Create FBX manager and scene
+    manager = pyfbx.Manager()
+    scene = pyfbx.Scene(manager)
+
+    # Create mesh node
+    mesh_node = pyfbx.Node(scene, 'Mesh')
+    scene.root.add_child(mesh_node)
+
+    # Create mesh object
+    mesh_obj = pyfbx.Mesh(scene)
+    mesh_node.add_child(mesh_obj)
+
+    # Set vertices and faces
+    mesh_obj.set_vertices(vertices)
+    mesh_obj.set_faces(faces)
+
+    # Create material
+    material = pyfbx.FbxMaterial(scene, 'Material')
+    mesh_obj.add_material(material)
+
+    # Set texture
+    texture_path = 'texture.png'
+    texture.save(texture_path)
+    texture_map = pyfbx.FbxTexture(scene, 'Texture')
+    texture_map.file_name = texture_path
+    material.add_texture(texture_map)
+
+    
+
+    return scene
+
+    
 
 def simplify_gs(
     gs: Gaussian,
